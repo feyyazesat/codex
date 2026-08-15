@@ -225,6 +225,7 @@ mod safety_buffering;
 mod session_lifecycle;
 mod side;
 mod startup_prompts;
+mod startup_session;
 mod thread_events;
 mod thread_goal_actions;
 mod thread_routing;
@@ -902,7 +903,7 @@ impl App {
             &session_selection,
             SessionSelection::StartFresh | SessionSelection::Exit
         );
-        let (mut chat_widget, initial_started_thread) = match session_selection {
+        let (mut chat_widget, initial_session) = match session_selection {
             SessionSelection::StartFresh | SessionSelection::Exit => {
                 spawn_startup_thread_start(&app_server, config.clone(), app_event_tx.clone());
                 // Count a startup tooltip once the initial chat widget can render it.
@@ -945,10 +946,15 @@ impl App {
                     &config,
                     &harness_overrides,
                 );
-                let resumed = app_server
-                    .resume_thread(config.clone(), target_session.thread_id, model_settings)
-                    .await
-                    .map_err(|err| session_start_error("resume", &target_session, err))?;
+                let resumed = startup_session::resume_or_read_only(
+                    &mut app_server,
+                    config.clone(),
+                    &target_session,
+                    model_settings,
+                    model.clone(),
+                )
+                .await
+                .map_err(|err| session_start_error("resume", &target_session, err))?;
                 let init = crate::chatwidget::ChatWidgetInit {
                     config: config.clone(),
                     frame_requester: tui.frame_requester(),
@@ -985,7 +991,11 @@ impl App {
                     &[("source", "cli_subcommand")],
                 );
                 let forked = app_server
-                    .fork_thread(config.clone(), target_session.thread_id)
+                    .fork_thread(
+                        config.clone(),
+                        target_session.thread_id,
+                        crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
+                    )
                     .await
                     .map_err(|err| session_start_error("fork", &target_session, err))?;
                 let init = crate::chatwidget::ChatWidgetInit {
@@ -1015,7 +1025,10 @@ impl App {
                         .clone(),
                     session_telemetry: session_telemetry.clone(),
                 };
-                (ChatWidget::new_with_app_event(init), Some(forked))
+                (
+                    ChatWidget::new_with_app_event(init),
+                    Some(startup_session::InitialSession::Live(forked)),
+                )
             }
         };
         chat_widget.remote_connection = remote_connection;
@@ -1095,16 +1108,26 @@ See the Codex keymap documentation for supported actions and examples."
         }
         app.update_visible_history_rows(tui.terminal.last_known_screen_size);
         let initial_session_started_at = Instant::now();
-        if let Some(started) = initial_started_thread {
-            let thread_id = started.session.thread_id;
-            if started.blocks_direct_input {
-                app.mark_primary_thread_parent_owned(thread_id);
-            }
-            app.enqueue_primary_thread_session(started.session, started.turns)
-                .await?;
-            if should_prompt_for_paused_goal_after_startup_resume {
-                app.maybe_prompt_resume_paused_goal_after_resume(&mut app_server, thread_id)
-                    .await;
+        if let Some(initial_session) = initial_session {
+            match initial_session {
+                startup_session::InitialSession::Live(started) => {
+                    let thread_id = started.session.thread_id;
+                    if started.blocks_direct_input {
+                        app.mark_primary_thread_parent_owned(thread_id);
+                    }
+                    app.enqueue_primary_thread_session(started.session, started.turns)
+                        .await?;
+                    if should_prompt_for_paused_goal_after_startup_resume {
+                        app.maybe_prompt_resume_paused_goal_after_resume(
+                            &mut app_server,
+                            thread_id,
+                        )
+                        .await;
+                    }
+                }
+                startup_session::InitialSession::ReadOnly(read_only) => {
+                    app.attach_read_only_session(read_only).await?;
+                }
             }
         }
         let initial_session_ms = initial_session_started_at.elapsed().as_millis();
