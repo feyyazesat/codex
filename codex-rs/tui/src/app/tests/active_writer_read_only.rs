@@ -175,6 +175,7 @@ async fn active_writer_fork_submits_preserved_startup_prompt() -> Result<()> {
         &crate::resume_picker::SessionTarget {
             path: Some(rollout_path),
             thread_id,
+            history_mode: None,
         },
         crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
         model,

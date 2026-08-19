@@ -34,6 +34,18 @@ fn blocked_thread_navigation_argument_policy_is_mode_specific() {
             "named",
             false,
         ),
+        (
+            DirectInputMode::ParentOwned,
+            SlashCommand::Export,
+            "transcript.md",
+            true,
+        ),
+        (
+            DirectInputMode::ActiveWriterReadOnly,
+            SlashCommand::Export,
+            "transcript.md",
+            true,
+        ),
     ];
 
     for (mode, command, args, expected) in cases {
