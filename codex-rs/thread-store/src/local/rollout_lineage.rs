@@ -96,7 +96,7 @@ impl LocalThreadStore {
                 LineageRepresentation::Existing => rollout_path,
                 LineageRepresentation::PlainForReference => {
                     let rollout_path = super::helpers::scoped_rollout_path(
-                        self.config.codex_home.clone(),
+                        self.config.codex_home.join(codex_rollout::SESSIONS_SUBDIR),
                         rollout_path.as_path(),
                         "Codex home",
                     )?;
