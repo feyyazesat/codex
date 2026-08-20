@@ -1,0 +1,5 @@
+---
+source: tui/src/app/tests/active_writer_read_only.rs
+expression: banner
+---
+• Thread [thread-id] is open in another Codex client. Replaying its saved transcript in read-only mode; use /fork to continue in a new thread.

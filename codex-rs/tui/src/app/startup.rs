@@ -222,7 +222,7 @@ impl App {
             &session_selection,
             SessionSelection::StartFresh | SessionSelection::Exit
         );
-        let (mut chat_widget, initial_started_thread) = match session_selection {
+        let (mut chat_widget, initial_session) = match session_selection {
             SessionSelection::StartFresh | SessionSelection::Exit => {
                 spawn_startup_thread_start(&app_server, config.clone(), app_event_tx.clone());
                 // Count a startup tooltip once the initial chat widget can render it.
@@ -282,10 +282,12 @@ impl App {
                 let resumed = match startup_draft
                     .run_until(
                         tui,
-                        app_server.resume_thread(
+                        super::startup_session::resume_or_read_only(
+                            &mut app_server,
                             config.clone(),
-                            target_session.thread_id,
+                            &target_session,
                             model_settings,
+                            model.clone(),
                         ),
                     )
                     .await
@@ -332,7 +334,11 @@ impl App {
                 let forked = match startup_draft
                     .run_until(
                         tui,
-                        app_server.fork_thread(config.clone(), target_session.thread_id),
+                        app_server.fork_thread(
+                            config.clone(),
+                            target_session.thread_id,
+                            crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
+                        ),
                     )
                     .await
                 {
@@ -368,7 +374,10 @@ impl App {
                         .clone(),
                     session_telemetry: session_telemetry.clone(),
                 };
-                (ChatWidget::new_with_app_event(init), Some(forked))
+                (
+                    ChatWidget::new_with_app_event(init),
+                    Some(super::startup_session::InitialSession::Live(forked)),
+                )
             }
         };
         chat_widget.note_rendered_width(tui.terminal.last_known_screen_size.width);
@@ -454,33 +463,46 @@ See the Codex keymap documentation for supported actions and examples."
         }
         app.update_visible_history_rows(tui.terminal.last_known_screen_size);
         let initial_session_started_at = Instant::now();
-        if let Some(started) = initial_started_thread {
-            let thread_id = started.session.thread_id;
-            if started.blocks_direct_input {
-                app.mark_primary_thread_parent_owned(thread_id);
-            }
-            match startup_draft
-                .run_until(
-                    tui,
-                    app.enqueue_primary_thread_session(started.session, started.turns),
-                )
-                .await
-            {
-                Ok(result) => result?,
-                Err(err) => return shutdown_on_startup_error(app_server, err).await,
-            }
-            if should_prompt_for_paused_goal_after_startup_resume
-                && let Err(err) = startup_draft
-                    .run_until(
-                        tui,
-                        app.maybe_prompt_resume_paused_goal_after_resume(
-                            &mut app_server,
-                            thread_id,
-                        ),
-                    )
-                    .await
-            {
-                return shutdown_on_startup_error(app_server, err).await;
+        if let Some(initial_session) = initial_session {
+            match initial_session {
+                super::startup_session::InitialSession::Live(started) => {
+                    let thread_id = started.session.thread_id;
+                    if started.blocks_direct_input {
+                        app.mark_primary_thread_parent_owned(thread_id);
+                    }
+                    match startup_draft
+                        .run_until(
+                            tui,
+                            app.enqueue_primary_thread_session(started.session, started.turns),
+                        )
+                        .await
+                    {
+                        Ok(result) => result?,
+                        Err(err) => return shutdown_on_startup_error(app_server, err).await,
+                    }
+                    if should_prompt_for_paused_goal_after_startup_resume
+                        && let Err(err) = startup_draft
+                            .run_until(
+                                tui,
+                                app.maybe_prompt_resume_paused_goal_after_resume(
+                                    &mut app_server,
+                                    thread_id,
+                                ),
+                            )
+                            .await
+                    {
+                        return shutdown_on_startup_error(app_server, err).await;
+                    }
+                }
+                super::startup_session::InitialSession::ReadOnly(read_only) => {
+                    match startup_draft
+                        .run_until(tui, app.attach_read_only_session(read_only))
+                        .await
+                    {
+                        Ok(result) => result?,
+                        Err(err) => return shutdown_on_startup_error(app_server, err).await,
+                    }
+                }
             }
         }
         let initial_session_ms = initial_session_started_at.elapsed().as_millis();
