@@ -132,6 +132,9 @@ impl ChatWidget {
     }
 
     fn slash_command_blocked_by_active_task(&self, cmd: SlashCommand) -> bool {
+        if self.direct_input_mode.allows_command_during_task(cmd) {
+            return false;
+        }
         (!cmd.available_during_task()
             && (self.turn_lifecycle.agent_turn_running
                 || self.review.is_review_mode
@@ -262,8 +265,8 @@ impl ChatWidget {
                 self.submit_user_message(INIT_PROMPT.to_string().into());
             }
             SlashCommand::Compact => {
-                if self.blocks_direct_input {
-                    self.add_error_message(PARENT_OWNED_INPUT_MESSAGE.to_string());
+                if self.direct_input_mode.is_blocked() {
+                    self.add_direct_input_blocked_message();
                     return;
                 }
                 self.clear_token_usage();

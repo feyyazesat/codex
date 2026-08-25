@@ -160,6 +160,14 @@ enum ForkPresentation {
     SideConversation,
 }
 
+struct ForkThreadOptions {
+    last_turn_id: Option<String>,
+    before_turn_id: Option<String>,
+    goal_continuation: ForkGoalContinuation,
+    presentation: ForkPresentation,
+    model_settings: ResumeModelSettings,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ThreadHistorySupport {
     Paginated,
@@ -167,7 +175,18 @@ enum ThreadHistorySupport {
 }
 
 fn bootstrap_request_error(context: &'static str, err: TypedRequestError) -> color_eyre::Report {
-    color_eyre::eyre::eyre!("{context}: {err}")
+    let message = format!("{context}: {err}");
+    color_eyre::eyre::Report::new(err).wrap_err(message)
+}
+
+pub(crate) fn is_active_writer_resume_error(err: &color_eyre::Report, thread_id: ThreadId) -> bool {
+    matches!(
+        err.downcast_ref::<TypedRequestError>(),
+        Some(TypedRequestError::Server { method, source })
+            if method == "thread/resume"
+                && source.code == JSONRPC_INVALID_REQUEST
+                && source.message == format!("thread {thread_id} already has an active writer")
+    )
 }
 
 pub(crate) fn is_history_pagination_unsupported(source: &JSONRPCErrorError) -> bool {
@@ -280,7 +299,7 @@ pub(crate) enum ThreadParamsMode {
     Remote,
 }
 
-/// Determines where model settings come from when resuming a thread.
+/// Determines where model settings come from when resuming or forking a thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResumeModelSettings {
     /// Sends the current config's model, provider, and reasoning effort as explicit overrides.
@@ -647,6 +666,7 @@ impl AppServerSession {
         &mut self,
         config: Config,
         thread_id: ThreadId,
+        model_settings: ResumeModelSettings,
     ) -> Result<AppServerStartedThread> {
         self.fork_thread_at(
             config,
@@ -654,6 +674,7 @@ impl AppServerSession {
             /*last_turn_id*/ None,
             /*before_turn_id*/ None,
             ForkGoalContinuation::StartIfIdle,
+            model_settings,
         )
         .await
     }
@@ -665,14 +686,18 @@ impl AppServerSession {
         last_turn_id: Option<String>,
         before_turn_id: Option<String>,
         goal_continuation: ForkGoalContinuation,
+        model_settings: ResumeModelSettings,
     ) -> Result<AppServerStartedThread> {
         self.fork_thread_at_with_presentation(
             config,
             thread_id,
-            last_turn_id,
-            before_turn_id,
-            goal_continuation,
-            ForkPresentation::Regular,
+            ForkThreadOptions {
+                last_turn_id,
+                before_turn_id,
+                goal_continuation,
+                presentation: ForkPresentation::Regular,
+                model_settings,
+            },
         )
         .await
     }
@@ -685,10 +710,13 @@ impl AppServerSession {
         self.fork_thread_at_with_presentation(
             config,
             thread_id,
-            /*last_turn_id*/ None,
-            /*before_turn_id*/ None,
-            ForkGoalContinuation::StartIfIdle,
-            ForkPresentation::SideConversation,
+            ForkThreadOptions {
+                last_turn_id: None,
+                before_turn_id: None,
+                goal_continuation: ForkGoalContinuation::StartIfIdle,
+                presentation: ForkPresentation::SideConversation,
+                model_settings: ResumeModelSettings::OverrideFromCurrentConfig,
+            },
         )
         .await
     }
@@ -697,11 +725,15 @@ impl AppServerSession {
         &mut self,
         config: Config,
         thread_id: ThreadId,
-        last_turn_id: Option<String>,
-        before_turn_id: Option<String>,
-        goal_continuation: ForkGoalContinuation,
-        presentation: ForkPresentation,
+        options: ForkThreadOptions,
     ) -> Result<AppServerStartedThread> {
+        let ForkThreadOptions {
+            last_turn_id,
+            before_turn_id,
+            goal_continuation,
+            presentation,
+            model_settings,
+        } = options;
         let fork_parent = match presentation {
             ForkPresentation::Regular => self
                 .thread_read(thread_id, /*include_turns*/ false)
@@ -726,6 +758,7 @@ impl AppServerSession {
                 thread_id,
                 self.thread_params_mode(),
                 self.remote_cwd_override.as_deref(),
+                model_settings,
             )
         };
         let response: ThreadForkResponse = match self
@@ -1696,6 +1729,42 @@ fn thread_start_params_from_config(
     }
 }
 
+struct ThreadModelOverrides {
+    model: Option<String>,
+    model_provider: Option<String>,
+    config: Option<HashMap<String, serde_json::Value>>,
+}
+
+fn thread_model_overrides_from_config(
+    config: &Config,
+    thread_params_mode: ThreadParamsMode,
+    model_settings: ResumeModelSettings,
+) -> ThreadModelOverrides {
+    let mut config_overrides = config_request_overrides_from_config(config);
+    if model_settings == ResumeModelSettings::RestoreFromThread
+        && let Some(overrides) = config_overrides.as_mut()
+    {
+        overrides.remove("model_reasoning_effort");
+        if overrides.is_empty() {
+            config_overrides = None;
+        }
+    }
+    let (model, model_provider) = match model_settings {
+        ResumeModelSettings::OverrideFromCurrentConfig => (
+            config.model.clone(),
+            thread_params_mode.model_provider_from_config(config),
+        ),
+        ResumeModelSettings::RestoreFromThread | ResumeModelSettings::PreserveExistingThread => {
+            (None, None)
+        }
+    };
+    ThreadModelOverrides {
+        model,
+        model_provider,
+        config: config_overrides,
+    }
+}
+
 fn thread_resume_params_from_config(
     config: Config,
     thread_id: ThreadId,
@@ -1761,6 +1830,7 @@ fn thread_fork_params_from_config(
     thread_id: ThreadId,
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<&std::path::Path>,
+    model_settings: ResumeModelSettings,
 ) -> ThreadForkParams {
     let permissions = permissions_selection_from_config(&config, thread_params_mode);
     let sandbox = permissions
@@ -1772,10 +1842,15 @@ fn thread_fork_params_from_config(
             )
         })
         .flatten();
+    let ThreadModelOverrides {
+        model,
+        model_provider,
+        config: config_overrides,
+    } = thread_model_overrides_from_config(&config, thread_params_mode, model_settings);
     ThreadForkParams {
         thread_id: thread_id.to_string(),
-        model: config.model.clone(),
-        model_provider: thread_params_mode.model_provider_from_config(&config),
+        model,
+        model_provider,
         service_tier: service_tier_override_from_config(&config),
         cwd: thread_cwd_from_config(&config, thread_params_mode, remote_cwd_override),
         runtime_workspace_roots: Some(config.workspace_roots.clone()),
@@ -1783,7 +1858,7 @@ fn thread_fork_params_from_config(
         approvals_reviewer: approvals_reviewer_override_from_config(&config),
         sandbox,
         permissions,
-        config: config_request_overrides_from_config(&config),
+        config: config_overrides,
         base_instructions: config.base_instructions.clone().filter(|_| {
             !matches!(
                 config.base_instructions_provenance,
@@ -2105,6 +2180,47 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
+    #[test]
+    fn active_writer_resume_error_is_classified_from_structured_error() {
+        let thread_id = ThreadId::new();
+        let report = bootstrap_request_error(
+            "thread/resume failed during TUI bootstrap",
+            TypedRequestError::Server {
+                method: "thread/resume".to_string(),
+                source: JSONRPCErrorError {
+                    code: JSONRPC_INVALID_REQUEST,
+                    message: format!("thread {thread_id} already has an active writer"),
+                    data: None,
+                },
+            },
+        );
+
+        assert_eq!(
+            report.to_string(),
+            format!(
+                "thread/resume failed during TUI bootstrap: thread/resume failed: thread {thread_id} already has an active writer (code -32600)"
+            )
+        );
+        assert!(is_active_writer_resume_error(&report, thread_id));
+    }
+
+    #[test]
+    fn unrelated_resume_error_is_not_classified_as_active_writer() {
+        let thread_id = ThreadId::new();
+        let report = bootstrap_request_error(
+            "thread/resume failed during TUI bootstrap",
+            TypedRequestError::Server {
+                method: "thread/resume".to_string(),
+                source: JSONRPCErrorError {
+                    code: JSONRPC_INVALID_REQUEST,
+                    message: "thread is archived".to_string(),
+                    data: None,
+                },
+            },
+        );
+
+        assert!(!is_active_writer_resume_error(&report, thread_id));
+    }
     async fn build_config(temp_dir: &TempDir) -> Config {
         ConfigBuilder::default()
             .codex_home(temp_dir.path().to_path_buf())
@@ -2649,6 +2765,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Remote,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
 
         assert_eq!(start.cwd, None);
@@ -2797,6 +2914,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Remote,
             Some(remote_cwd.as_path()),
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
 
         assert_eq!(start.cwd.as_deref(), Some("repo/on/server"));
@@ -2849,6 +2967,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
 
         let expected_service_tier = Some(Some(ServiceTier::Fast.request_value().to_string()));
@@ -3005,7 +3124,11 @@ mod tests {
         let mut ephemeral_config = config;
         ephemeral_config.ephemeral = true;
         let normal_ephemeral_fork = app_server
-            .fork_thread(ephemeral_config.clone(), source_thread_id)
+            .fork_thread(
+                ephemeral_config.clone(),
+                source_thread_id,
+                ResumeModelSettings::OverrideFromCurrentConfig,
+            )
             .await?;
         let side_fork = app_server
             .fork_side_thread(ephemeral_config, source_thread_id)
@@ -3042,7 +3165,11 @@ mod tests {
         ephemeral_config.ephemeral = true;
 
         let fork = app_server
-            .fork_thread(ephemeral_config, source_thread_id)
+            .fork_thread(
+                ephemeral_config,
+                source_thread_id,
+                ResumeModelSettings::OverrideFromCurrentConfig,
+            )
             .await?;
 
         assert_eq!(fork.session.forked_from_id, Some(source_thread_id));
@@ -3177,6 +3304,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
 
         assert_eq!(params.base_instructions.as_deref(), Some("Base override."));
@@ -3193,6 +3321,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Remote,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
 
         assert_eq!(params.base_instructions, None);
@@ -3216,7 +3345,13 @@ mod tests {
         )?;
         let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
 
-        let regular = app_server.fork_thread(config.clone(), thread_id).await?;
+        let regular = app_server
+            .fork_thread(
+                config.clone(),
+                thread_id,
+                ResumeModelSettings::OverrideFromCurrentConfig,
+            )
+            .await?;
         let side = app_server.fork_side_thread(config, thread_id).await?;
 
         assert_eq!(regular.turns.len(), 1);
@@ -3258,6 +3393,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
 
         assert_eq!(control_start.developer_instructions, None);
@@ -3288,6 +3424,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
         let expected = format!(
             "Developer override.\n\n{}",
