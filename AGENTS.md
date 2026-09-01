@@ -1,3 +1,9 @@
+# Custom release builds
+
+- For a custom Codex release migration, base the branch on the target upstream `rust-v<version>` tag and keep the complete custom changeset as one top commit.
+- Build and package the CLI and native `codex-code-mode-host` together as a matched release artifact. Use the package assembler so the host receives the matching Codex-published V8 archive and binding; do not ship a CLI-only custom build.
+- Building the host does not authorize host-source changes. Keep custom host implementation changes out of scope unless the user explicitly requests them.
+
 # Rust/codex-rs
 
 In the codex-rs folder where the rust code lives:
