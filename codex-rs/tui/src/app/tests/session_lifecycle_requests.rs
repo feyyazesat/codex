@@ -1,5 +1,6 @@
 use super::*;
 use crate::app_event::TranscriptExportDestination;
+use crate::app_server_session::ResumeModelSettings;
 use app_test_support::create_fake_paginated_rollout;
 use app_test_support::create_fake_parented_rollout_with_source;
 use app_test_support::create_fake_rollout;
@@ -531,7 +532,11 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
     assert!(resumed.task_tools_available);
     assert!(restarted_app_server.task_tools_available(target_id));
     let forked = restarted_app_server
-        .fork_thread(app.config.clone(), target_id)
+        .fork_thread(
+            app.config.clone(),
+            target_id,
+            crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
+        )
         .await?;
     assert!(forked.task_tools_available);
     assert!(restarted_app_server.task_tools_available(forked.session.thread_id));
@@ -739,7 +744,11 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         starts[0]["config"]["mcp_servers.codex_tui"]
     );
     app_server
-        .fork_thread(app.config.clone(), delegation_source)
+        .fork_thread(
+            app.config.clone(),
+            delegation_source,
+            crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
+        )
         .await?;
     let forked = recorded_params(&requests, "thread/fork")
         .pop()
@@ -1797,7 +1806,11 @@ async fn remote_legacy_history_start_negotiates_once_for_resume_and_fork() -> Re
         )
         .await?;
     let forked = app_server
-        .fork_thread(app.config.clone(), legacy_thread_id)
+        .fork_thread(
+            app.config.clone(),
+            legacy_thread_id,
+            ResumeModelSettings::OverrideFromCurrentConfig,
+        )
         .await?;
 
     assert_ne!(started.session.thread_id, legacy_thread_id);
@@ -1924,7 +1937,11 @@ async fn assert_remote_legacy_history_retry(request: LegacyHistoryRequest) -> Re
         }
         LegacyHistoryRequest::Fork => {
             let forked = app_server
-                .fork_thread(app.config.clone(), legacy_thread_id)
+                .fork_thread(
+                    app.config.clone(),
+                    legacy_thread_id,
+                    ResumeModelSettings::OverrideFromCurrentConfig,
+                )
                 .await?;
             assert_ne!(forked.session.thread_id, legacy_thread_id);
             "thread/fork"
@@ -1986,7 +2003,11 @@ async fn paginated_fork_survives_post_response_hydration_failure() -> Result<()>
     assert_eq!(started.session.thread_id, parent_thread_id);
 
     let forked = app_server
-        .fork_thread(app.config.clone(), parent_thread_id)
+        .fork_thread(
+            app.config.clone(),
+            parent_thread_id,
+            ResumeModelSettings::OverrideFromCurrentConfig,
+        )
         .await?;
 
     assert_ne!(forked.session.thread_id, parent_thread_id);
@@ -2221,7 +2242,11 @@ async fn paginated_workflows_never_request_full_thread_history() -> Result<()> {
     .await?;
     assert!(!cells.is_empty());
     app_server
-        .fork_thread(app.config.clone(), paginated_thread_id)
+        .fork_thread(
+            app.config.clone(),
+            paginated_thread_id,
+            ResumeModelSettings::OverrideFromCurrentConfig,
+        )
         .await?;
     let mut side_config = app.config.clone();
     side_config.ephemeral = true;

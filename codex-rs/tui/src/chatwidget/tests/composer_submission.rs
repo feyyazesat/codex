@@ -237,6 +237,7 @@ async fn parent_owned_thread_blocks_all_direct_input_entry_points() {
     for command in [
         "/init",
         "/review check this",
+        "/fork",
         "/side inspect this",
         "/archive",
         "/rename",
@@ -305,6 +306,22 @@ async fn parent_owned_thread_blocks_settings_shortcuts() {
 }
 
 #[tokio::test]
+async fn parent_owned_thread_allows_resume_during_running_turn() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ Some("gpt-5")).await;
+    chat.set_parent_owned_thread();
+    handle_turn_started(&mut chat, "turn-1");
+    drain_insert_history(&mut rx);
+    chat.bottom_pane
+        .set_composer_text("/resume saved-thread".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|event| {
+        matches!(event, AppEvent::ResumeSessionByIdOrName(id) if id == "saved-thread")
+    }));
+}
+
+#[tokio::test]
 async fn parent_owned_thread_restores_pending_initial_prompt() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ Some("gpt-5")).await;
     let pending_prompt = "keep this startup prompt".to_string();
@@ -332,6 +349,105 @@ async fn parent_owned_thread_restores_pending_initial_prompt() {
         format!("{pending_prompt}\ntyped during startup")
     );
     assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn active_writer_read_only_thread_preserves_prompt_and_mode_across_side() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ Some("gpt-5")).await;
+    let pending_prompt = UserMessage::from("continue after fork");
+    chat.initial_user_message = Some(pending_prompt.clone());
+    chat.set_read_only_thread(crate::app_server_session::ResumeModelSettings::RestoreFromThread);
+
+    chat.submit_initial_user_message_if_pending();
+    chat.set_side_conversation_active(/*active*/ true);
+    chat.set_side_conversation_active(/*active*/ false);
+
+    assert_eq!(chat.initial_user_message, Some(pending_prompt));
+    assert_eq!(
+        chat.direct_input_mode,
+        DirectInputMode::ActiveWriterReadOnly
+    );
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn active_writer_read_only_thread_preserves_prompt_in_thread_input_state() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ Some("gpt-5")).await;
+    let pending_prompt = UserMessage::from("continue after returning from side");
+    chat.initial_user_message = Some(pending_prompt.clone());
+    chat.set_read_only_thread(
+        crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
+    );
+    let input_state = chat.capture_thread_input_state();
+    chat.initial_user_message = None;
+    chat.set_read_only_thread(crate::app_server_session::ResumeModelSettings::RestoreFromThread);
+
+    chat.restore_thread_input_state(
+        input_state,
+        ThreadInputStateRestoreMode {
+            preserve_in_flight_turn: true,
+        },
+    );
+
+    assert_eq!(chat.take_initial_user_message(), Some(pending_prompt));
+    assert_eq!(
+        chat.fork_model_settings(),
+        crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig
+    );
+}
+
+#[tokio::test]
+async fn active_writer_read_only_thread_allows_fork_during_replayed_turn() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ Some("gpt-5")).await;
+    chat.set_read_only_thread(crate::app_server_session::ResumeModelSettings::RestoreFromThread);
+    handle_turn_started(&mut chat, "turn-1");
+    drain_insert_history(&mut rx);
+    chat.bottom_pane
+        .set_composer_text("/for".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| matches!(event, AppEvent::ForkCurrentSession { name: None }))
+    );
+}
+
+#[tokio::test]
+async fn active_writer_read_only_thread_allows_resume_during_replayed_turn() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ Some("gpt-5")).await;
+    chat.set_read_only_thread(crate::app_server_session::ResumeModelSettings::RestoreFromThread);
+    handle_turn_started(&mut chat, "turn-1");
+    drain_insert_history(&mut rx);
+    chat.bottom_pane
+        .set_composer_text("/resume saved-thread".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|event| {
+        matches!(event, AppEvent::ResumeSessionByIdOrName(id) if id == "saved-thread")
+    }));
+}
+
+#[tokio::test]
+async fn active_writer_read_only_thread_rejects_input_snapshot() {
+    let (mut chat, mut rx, mut op_rx) =
+        make_chatwidget_manual(/*model_override*/ Some("gpt-5")).await;
+    chat.set_read_only_thread(crate::app_server_session::ResumeModelSettings::RestoreFromThread);
+    drain_insert_history(&mut rx);
+    chat.bottom_pane
+        .set_composer_text("blocked input".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_no_submit_op(&mut op_rx);
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .flatten()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_chatwidget_snapshot!("active_writer_read_only_thread_rejects_input", rendered);
 }
 
 #[tokio::test]
@@ -1749,6 +1865,9 @@ async fn restore_thread_input_state_applies_running_state_policy() {
             text: "composer draft".to_string(),
             ..Default::default()
         }),
+        initial_user_message: None,
+        fork_model_settings:
+            crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
         safety_buffering_prompt: Some(UserMessage::from("buffered prompt")),
         pending_steers: VecDeque::from([UserMessage::from("submitted to the interrupted turn")]),
         pending_steer_history_records: VecDeque::from([pending_history.clone()]),
