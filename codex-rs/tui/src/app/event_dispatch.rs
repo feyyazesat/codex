@@ -346,7 +346,14 @@ impl App {
                     fork_config.model = Some(self.chat_widget.current_model().to_string());
                     fork_config.model_reasoning_effort =
                         self.chat_widget.current_reasoning_effort();
-                    match app_server.fork_thread(fork_config, thread_id).await {
+                    match app_server
+                        .fork_thread(
+                            fork_config,
+                            thread_id,
+                            self.chat_widget.fork_model_settings(),
+                        )
+                        .await
+                    {
                         Ok(mut forked) => {
                             let name_error = if let Some(name) = name {
                                 match app_server
@@ -364,13 +371,14 @@ impl App {
                             } else {
                                 None
                             };
+                            let initial_user_message = self.chat_widget.take_initial_user_message();
                             self.shutdown_current_thread(app_server).await;
                             match self
                                 .replace_chat_widget_with_app_server_thread(
                                     tui,
                                     forked,
                                     ThreadAttachPresentation::SessionLineage,
-                                    /*initial_user_message*/ None,
+                                    initial_user_message,
                                 )
                                 .await
                             {
@@ -505,6 +513,7 @@ impl App {
                                     /*last_turn_id*/ None,
                                     before_turn_id,
                                     ForkGoalContinuation::StartIfIdle,
+                                    crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
                                 )
                                 .await
                         }

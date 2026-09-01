@@ -3,6 +3,7 @@
 use super::session_lifecycle::ThreadAttachPresentation;
 use super::*;
 use crate::app_server_session::ForkGoalContinuation::DeferUntilNextTurn;
+use crate::app_server_session::ResumeModelSettings;
 use crate::history_cell::McpInventoryLoadingCell as LoadingCell;
 use codex_app_server_protocol::ThreadBackgroundTerminalsListParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsListResponse as ListResponse;
@@ -147,6 +148,7 @@ impl App {
                     /*last_turn_id*/ None,
                     /*before_turn_id*/ None,
                     DeferUntilNextTurn,
+                    ResumeModelSettings::OverrideFromCurrentConfig,
                 )
                 .await
         } else {

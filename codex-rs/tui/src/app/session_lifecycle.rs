@@ -482,10 +482,15 @@ impl App {
                 .add_error_message(format!("Agent thread {thread_id} is no longer available."));
             return Ok(());
         }
-        let mut is_replay_only = self
+        let is_closed = self
             .agent_navigation
             .get(&thread_id)
             .is_some_and(|entry| entry.is_closed);
+        let mut is_replay_only = is_closed
+            || self
+                .thread_event_channels
+                .get(&thread_id)
+                .is_some_and(|channel| channel.attachment() == ThreadEventAttachment::ReplayOnly);
         let mut attached_replay_only = false;
         if self.should_attach_live_thread_for_selection(thread_id) {
             match self
@@ -569,6 +574,10 @@ impl App {
             .note_rendered_width(tui.terminal.last_known_screen_size.width);
         if blocks_direct_input {
             self.chat_widget.set_parent_owned_thread();
+        } else if is_replay_only {
+            self.chat_widget.set_read_only_thread(
+                crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+            );
         }
 
         self.reset_for_thread_switch(tui)?;
@@ -578,8 +587,12 @@ impl App {
                 format!(
                     "Agent thread {thread_id} could not be resumed live. Replaying saved transcript."
                 )
-            } else {
+            } else if is_closed {
                 format!("Agent thread {thread_id} is closed. Replaying saved transcript.")
+            } else {
+                format!(
+                    "Thread {thread_id} is open in another Codex client. Replaying its saved transcript in read-only mode; use /fork to continue in a new thread."
+                )
             };
             self.chat_widget.add_info_message(message, /*hint*/ None);
         }
@@ -825,9 +838,9 @@ impl App {
         presentation: ThreadAttachPresentation,
         initial_user_message: Option<crate::chatwidget::UserMessage>,
     ) -> Result<()> {
-        // Initial messages are for freshly attached primary threads only. Thread switches and
-        // resume/fork flows pass `None` so they cannot replay old history and then auto-submit a new
-        // user turn by accident.
+        // Initial messages are normally for freshly attached primary threads. Active-writer
+        // read-only sessions also pass their preserved startup prompt when `/fork` creates the
+        // writable continuation.
         self.reset_thread_event_state();
         let init = self.chatwidget_init_for_forked_or_resumed_thread(
             tui,
@@ -1096,16 +1109,16 @@ impl App {
         if let Some(history_mode) = target_session.history_mode {
             app_server.remember_thread_history_mode(target_session.thread_id, history_mode);
         }
-        match app_server
-            .resume_thread(
-                resume_config.clone(),
-                target_session.thread_id,
-                self.resume_model_settings(),
-            )
-            .await
+        match super::startup_session::resume_or_read_only(
+            app_server,
+            resume_config.clone(),
+            &target_session,
+            self.resume_model_settings(),
+            self.chat_widget.current_model().to_string(),
+        )
+        .await
         {
-            Ok(resumed) => {
-                let resumed_thread_id = resumed.session.thread_id;
+            Ok(initial_session) => {
                 self.shutdown_current_thread(app_server).await;
                 self.config = resume_config;
                 tui.set_notification_settings(
@@ -1114,15 +1127,27 @@ impl App {
                 );
                 self.file_search
                     .update_search_dir(self.config.cwd.to_path_buf());
-                match self
-                    .replace_chat_widget_with_app_server_thread(
-                        tui,
-                        resumed,
-                        ThreadAttachPresentation::SessionLineage,
-                        /*initial_user_message*/ None,
-                    )
-                    .await
-                {
+                let (resumed_thread_id, should_prompt_paused_goal, attach_result) =
+                    match initial_session {
+                        super::startup_session::InitialSession::Live(resumed) => {
+                            let thread_id = resumed.session.thread_id;
+                            let result = self
+                                .replace_chat_widget_with_app_server_thread(
+                                    tui,
+                                    resumed,
+                                    ThreadAttachPresentation::SessionLineage,
+                                    /*initial_user_message*/ None,
+                                )
+                                .await;
+                            (thread_id, true, result)
+                        }
+                        super::startup_session::InitialSession::ReadOnly(read_only) => {
+                            let thread_id = target_session.thread_id;
+                            let result = self.replace_with_read_only_session(tui, read_only).await;
+                            (thread_id, false, result)
+                        }
+                    };
+                match attach_result {
                     Ok(()) => {
                         self.backfill_loaded_subagent_threads(app_server).await;
                         self.replay_agents_overview_requests(app_server, resumed_thread_id)
@@ -1139,11 +1164,13 @@ impl App {
                             }
                             self.chat_widget.add_plain_history_lines(lines);
                         }
-                        self.maybe_prompt_resume_paused_goal_after_resume(
-                            app_server,
-                            resumed_thread_id,
-                        )
-                        .await;
+                        if should_prompt_paused_goal {
+                            self.maybe_prompt_resume_paused_goal_after_resume(
+                                app_server,
+                                resumed_thread_id,
+                            )
+                            .await;
+                        }
                     }
                     Err(err) => {
                         self.chat_widget.add_error_message(format!(

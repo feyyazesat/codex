@@ -8,8 +8,27 @@ use super::*;
 
 impl ChatWidget {
     pub(crate) fn set_parent_owned_thread(&mut self) {
-        self.blocks_direct_input = true;
+        self.direct_input_mode = DirectInputMode::ParentOwned;
         self.bottom_pane.set_parent_owned_thread();
+    }
+
+    pub(crate) fn set_read_only_thread(
+        &mut self,
+        model_settings: crate::app_server_session::ResumeModelSettings,
+    ) {
+        self.direct_input_mode = DirectInputMode::ActiveWriterReadOnly;
+        self.fork_model_settings = model_settings;
+        self.bottom_pane.set_read_only_thread();
+    }
+
+    pub(crate) fn fork_model_settings(&self) -> crate::app_server_session::ResumeModelSettings {
+        self.fork_model_settings
+    }
+
+    pub(super) fn add_direct_input_blocked_message(&mut self) {
+        if let Some(message) = self.direct_input_mode.blocked_message() {
+            self.add_error_message(message.to_string());
+        }
     }
 
     pub(super) fn handle_composer_input_result(
@@ -70,8 +89,8 @@ impl ChatWidget {
             InputResult::CommandWithArgs(cmd, args, text_elements) => {
                 self.handle_slash_command_with_args_dispatch(cmd, args, text_elements);
             }
-            InputResult::ParentOwnedInputBlocked => {
-                self.add_error_message(PARENT_OWNED_INPUT_MESSAGE.to_string());
+            InputResult::DirectInputBlocked => {
+                self.add_direct_input_blocked_message();
             }
             InputResult::None => {}
         }
@@ -143,7 +162,7 @@ impl ChatWidget {
         {
             return false;
         }
-        if self.blocks_direct_input {
+        if self.direct_input_mode.is_blocked() {
             return false;
         }
         if self.is_user_turn_pending_or_running() {
@@ -256,8 +275,8 @@ impl ChatWidget {
         text: String,
         mut collaboration_mode: CollaborationModeMask,
     ) {
-        if self.blocks_direct_input {
-            self.add_error_message(PARENT_OWNED_INPUT_MESSAGE.to_string());
+        if self.direct_input_mode.is_blocked() {
+            self.add_direct_input_blocked_message();
             return;
         }
         if collaboration_mode.mode == Some(ModeKind::Plan)

@@ -98,11 +98,14 @@
 //! Slash commands with arguments (like `/plan` and `/review`) reuse the same preparation path so
 //! pasted content and text elements are preserved when extracting args.
 //!
-//! # Parent-Owned Thread Mode
+//! # Direct-Input-Blocked Thread Modes
 //!
 //! Parent-owned subagent threads keep the draft editable while blocking agent-directed submission.
+//! Threads already open in another client use the same submission guard, but additionally allow
+//! `/fork` so the saved transcript can become a writable continuation. Both modes allow `/resume`,
+//! including an inline thread id or name, so the user can navigate away without editing history.
 //! On the `Enter` and `Tab` submission paths, normal prompts, disallowed slash commands, and `!`
-//! shell commands return `ParentOwnedInputBlocked` without clearing the draft. Bare local and
+//! shell commands return `DirectInputBlocked` without clearing the draft. Bare local and
 //! navigation slash commands remain available so users can leave or manage the view. Transcript
 //! exports also remain available, including an explicit destination filename.
 //!
@@ -287,6 +290,7 @@ use codex_protocol::user_input::TextElement;
 
 mod attachment_state;
 mod completion_target;
+mod direct_input_policy;
 mod draft_state;
 mod footer_state;
 mod history_search;
@@ -294,6 +298,7 @@ mod popup_state;
 mod slash_input;
 
 use self::attachment_state::AttachmentState;
+use self::direct_input_policy::blocked_thread_command_is_allowed;
 use self::draft_state::ComposerMentionBinding;
 use self::draft_state::DraftState;
 use self::footer_state::FooterState;
@@ -310,6 +315,7 @@ use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
 use crate::bottom_pane::textarea::TextArea;
+use crate::chatwidget::DirectInputMode;
 use crate::clipboard_paste::normalize_pasted_path;
 use crate::clipboard_paste::pasted_image_format;
 use crate::history_cell;
@@ -372,61 +378,9 @@ pub enum InputResult {
     /// command-history entry still represents the original command invocation that should be
     /// committed only if dispatch accepts it.
     CommandWithArgs(SlashCommand, String, Vec<TextElement>),
-    /// Agent-directed input was attempted while viewing a parent-owned spawned child thread.
-    ParentOwnedInputBlocked,
+    /// Agent-directed input was attempted while viewing a thread that does not accept input.
+    DirectInputBlocked,
     None,
-}
-
-fn parent_owned_command_is_allowed(command: SlashCommand, args: &str) -> bool {
-    if command == SlashCommand::Export {
-        return true;
-    }
-
-    args.is_empty()
-        && matches!(
-            command,
-            SlashCommand::Feedback
-                | SlashCommand::New
-                | SlashCommand::Clear
-                | SlashCommand::Resume
-                | SlashCommand::App
-                | SlashCommand::Side
-                | SlashCommand::Btw
-                | SlashCommand::Agents
-                | SlashCommand::MultiAgents
-                | SlashCommand::Vim
-                | SlashCommand::Keymap
-                | SlashCommand::ElevateSandbox
-                | SlashCommand::SandboxReadRoot
-                | SlashCommand::Experimental
-                | SlashCommand::Memories
-                | SlashCommand::Quit
-                | SlashCommand::Exit
-                | SlashCommand::Logout
-                | SlashCommand::Copy
-                | SlashCommand::Raw
-                | SlashCommand::Diff
-                | SlashCommand::Mention
-                | SlashCommand::Skills
-                | SlashCommand::Import
-                | SlashCommand::Hooks
-                | SlashCommand::Status
-                | SlashCommand::Usage
-                | SlashCommand::Ide
-                | SlashCommand::DebugConfig
-                | SlashCommand::Title
-                | SlashCommand::Statusline
-                | SlashCommand::Theme
-                | SlashCommand::Pets
-                | SlashCommand::Ps
-                | SlashCommand::Stop
-                | SlashCommand::MemoryDrop
-                | SlashCommand::MemoryUpdate
-                | SlashCommand::Mcp
-                | SlashCommand::Apps
-                | SlashCommand::Plugins
-                | SlashCommand::Rollout
-        )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,7 +451,7 @@ pub(crate) struct ChatComposer {
     effort_observed: bool,
     attachments: AttachmentState,
     placeholder_text: String,
-    blocks_direct_input: bool,
+    direct_input_mode: DirectInputMode,
     is_task_running: bool,
     queue_submissions: bool,
     /// Slash-command draft staged for local recall after application-level dispatch.
@@ -674,7 +628,7 @@ impl ChatComposer {
             effort_observed: false,
             attachments: AttachmentState::default(),
             placeholder_text,
-            blocks_direct_input: false,
+            direct_input_mode: DirectInputMode::Writable,
             is_task_running: false,
             queue_submissions: false,
             pending_slash_command_history: None,
@@ -1649,8 +1603,21 @@ impl ChatComposer {
     }
 
     pub(crate) fn set_parent_owned_thread(&mut self) {
-        self.blocks_direct_input = true;
+        self.direct_input_mode = DirectInputMode::ParentOwned;
         self.placeholder_text = "Viewing sub-agent — direct input is disabled".to_string();
+    }
+
+    pub(crate) fn set_read_only_thread(&mut self) {
+        self.direct_input_mode = DirectInputMode::ActiveWriterReadOnly;
+        self.placeholder_text = "Viewing active thread — use /fork to continue".to_string();
+    }
+
+    pub(crate) fn set_direct_input_mode(&mut self, mode: DirectInputMode) {
+        match mode {
+            DirectInputMode::Writable => self.direct_input_mode = DirectInputMode::Writable,
+            DirectInputMode::ParentOwned => self.set_parent_owned_thread(),
+            DirectInputMode::ActiveWriterReadOnly => self.set_read_only_thread(),
+        }
     }
 
     /// Move the cursor to the end of the current text buffer.
@@ -3110,7 +3077,7 @@ impl ChatComposer {
         should_queue: bool,
         now: Instant,
     ) -> (InputResult, bool) {
-        // Preserve newlines that are part of a paste before applying parent-owned submission
+        // Preserve newlines that are part of a paste before applying blocked-thread submission
         // policy. Queued startup input still flushes the burst into its queued message below.
         let in_slash_context = self.slash_commands_enabled()
             && !self.draft.is_bash_mode
@@ -3144,7 +3111,7 @@ impl ChatComposer {
             return (InputResult::None, true);
         }
 
-        if let Some(result) = self.handle_parent_owned_submission() {
+        if let Some(result) = self.handle_blocked_thread_submission() {
             return result;
         }
         if should_queue {
@@ -3269,8 +3236,8 @@ impl ChatComposer {
         }
     }
 
-    fn handle_parent_owned_submission(&mut self) -> Option<(InputResult, bool)> {
-        if !self.blocks_direct_input {
+    fn handle_blocked_thread_submission(&mut self) -> Option<(InputResult, bool)> {
+        if !self.direct_input_mode.is_blocked() {
             return None;
         }
 
@@ -3280,14 +3247,18 @@ impl ChatComposer {
                 self.slash_input().command(name),
                 Some(SlashCommandItem::Builtin(command))
                     if name == command.command()
-                        && parent_owned_command_is_allowed(command, args)
+                        && blocked_thread_command_is_allowed(
+                            self.direct_input_mode,
+                            command,
+                            args,
+                        )
             )
         });
         if text.starts_with('/') && allowed_slash_command {
             return None;
         }
 
-        Some((InputResult::ParentOwnedInputBlocked, true))
+        Some((InputResult::DirectInputBlocked, true))
     }
 
     /// Check if the first line is a bare slash command (no args) and dispatch it.
@@ -3365,7 +3336,13 @@ impl ChatComposer {
     }
 
     fn reject_slash_command_if_unavailable(&self, command: &SlashCommandItem) -> bool {
-        if !self.is_task_running || command.available_during_task() {
+        let read_only_command = match command {
+            SlashCommandItem::Builtin(command) => {
+                self.direct_input_mode.allows_command_during_task(*command)
+            }
+            SlashCommandItem::ServiceTier(_) => false,
+        };
+        if !self.is_task_running || command.available_during_task() || read_only_command {
             return false;
         }
         let message = format!(
@@ -5082,6 +5059,52 @@ mod tests {
     }
 
     #[test]
+    fn read_only_thread_allows_navigation_commands_with_arguments() {
+        for (command, expected, args) in [
+            ("/fork writable copy", SlashCommand::Fork, "writable copy"),
+            ("/resume saved-thread", SlashCommand::Resume, "saved-thread"),
+        ] {
+            let (mut composer, _rx) = new_test_composer();
+            composer.set_read_only_thread();
+            composer.set_text_content(command.to_string(), Vec::new(), Vec::new());
+
+            assert_eq!(
+                composer.handle_submission(/*should_queue*/ false).0,
+                InputResult::CommandWithArgs(expected, args.to_string(), Vec::new())
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_thread_allows_fork_selected_from_prefix() {
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_read_only_thread();
+        type_chars_humanlike(&mut composer, &['/', 'f', 'o']);
+
+        let result = composer
+            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .0;
+
+        assert_eq!(result, InputResult::Command(SlashCommand::Fork));
+    }
+
+    #[test]
+    fn writable_direct_input_mode_reenables_submission() {
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_read_only_thread();
+        composer.set_direct_input_mode(DirectInputMode::Writable);
+        composer.set_text_content("writable again".to_string(), Vec::new(), Vec::new());
+
+        assert_eq!(
+            composer.handle_submission(/*should_queue*/ false).0,
+            InputResult::Submitted {
+                text: "writable again".to_string(),
+                text_elements: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
     fn parent_owned_thread_placeholder_snapshot() {
         snapshot_composer_state(
             "parent_owned_thread_placeholder",
@@ -5111,6 +5134,15 @@ mod tests {
             );
             insta::assert_snapshot!("light_terminal_palette_composer", format!("{buffer:?}"));
         });
+    }
+
+    #[test]
+    fn read_only_thread_placeholder_snapshot() {
+        snapshot_composer_state(
+            "read_only_thread_placeholder",
+            /*enhanced_keys_supported*/ false,
+            ChatComposer::set_read_only_thread,
+        );
     }
 
     #[test]
@@ -9732,8 +9764,8 @@ mod tests {
             InputResult::Queued { .. } => {
                 panic!("expected command dispatch, but composer queued literal text")
             }
-            InputResult::ParentOwnedInputBlocked => {
-                panic!("expected command dispatch, but parent-owned input was blocked")
+            InputResult::DirectInputBlocked => {
+                panic!("expected command dispatch, but direct input was blocked")
             }
             InputResult::None => panic!("expected Command result for '/init'"),
         }
@@ -10242,8 +10274,8 @@ mod tests {
             InputResult::Queued { .. } => {
                 panic!("expected command dispatch after Tab completion, got literal queue")
             }
-            InputResult::ParentOwnedInputBlocked => {
-                panic!("expected command dispatch, but parent-owned input was blocked")
+            InputResult::DirectInputBlocked => {
+                panic!("expected command dispatch, but direct input was blocked")
             }
             InputResult::None => panic!("expected Command result for '/diff'"),
         }
@@ -10442,8 +10474,8 @@ mod tests {
             InputResult::Queued { .. } => {
                 panic!("expected command dispatch, but composer queued literal text")
             }
-            InputResult::ParentOwnedInputBlocked => {
-                panic!("expected command dispatch, but parent-owned input was blocked")
+            InputResult::DirectInputBlocked => {
+                panic!("expected command dispatch, but direct input was blocked")
             }
             InputResult::None => panic!("expected Command result for '/mention'"),
         }
