@@ -169,8 +169,8 @@ impl ChatWidget {
                 && !self.bottom_pane.is_task_running()
                 && self.bottom_pane.no_modal_or_popup_active() =>
             {
-                if self.blocks_direct_input {
-                    self.add_error_message(PARENT_OWNED_INPUT_MESSAGE.to_string());
+                if self.direct_input_mode.is_blocked() {
+                    self.add_direct_input_blocked_message();
                 } else {
                     self.cycle_collaboration_mode();
                 }

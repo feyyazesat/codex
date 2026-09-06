@@ -169,6 +169,9 @@ macro_rules! assert_app_snapshot {
     };
 }
 
+#[path = "tests/active_writer_read_only.rs"]
+mod active_writer_read_only;
+
 fn test_absolute_path(path: &str) -> AbsolutePathBuf {
     AbsolutePathBuf::try_from(PathBuf::from(path)).expect("absolute test path")
 }

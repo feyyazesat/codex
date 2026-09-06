@@ -1,0 +1,5 @@
+---
+source: tui/src/chatwidget/tests/composer_submission.rs
+expression: rendered
+---
+■ Direct input is disabled for this thread. Use /fork to continue in a new thread.

@@ -1244,7 +1244,10 @@ async fn startup_thread_start_failure_returns_error() {
     .await
     .expect("embedded app server");
     let err = app
-        .handle_startup_thread_started(&mut app_server, Err(color_eyre::eyre::eyre!("boom")))
+        .handle_startup_thread_started(
+            &mut app_server,
+            Err(color_eyre::eyre::eyre!("boom").to_string()),
+        )
         .await
         .expect_err("startup thread failure should exit instead of leaving chat unconfigured");
 

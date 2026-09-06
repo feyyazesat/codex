@@ -181,6 +181,7 @@ impl App {
                 /*last_turn_id*/ None,
                 /*before_turn_id*/ Some(turn_id),
                 ForkGoalContinuation::DeferUntilNextTurn,
+                crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
             )
             .await;
         let started = match started {

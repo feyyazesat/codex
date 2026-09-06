@@ -134,6 +134,44 @@ async fn resolves_archived_ancestors() {
     assert_eq!(lineage.segments[0].rollout_path, root_path);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn resolves_reference_lineage_from_symlinked_sessions_directory() {
+    let profile_home = TempDir::new().expect("profile temp dir");
+    let shared_home = TempDir::new().expect("shared temp dir");
+    let shared_sessions = shared_home.path().join("sessions");
+    fs::create_dir_all(shared_sessions.as_path()).expect("create shared sessions directory");
+    std::os::unix::fs::symlink(
+        shared_sessions.as_path(),
+        profile_home.path().join("sessions"),
+    )
+    .expect("link shared sessions directory");
+
+    let store = LocalThreadStore::new(test_config(profile_home.path()), /*state_db*/ None);
+    let thread_id = ThreadId::default();
+    let rollout_path = write_rollout(
+        shared_home.path(),
+        thread_id,
+        /*history_base*/ None,
+        /*next_ordinal*/ 2,
+    );
+
+    let lineage = store
+        .resolve_rollout_lineage_for_reference(thread_id)
+        .await
+        .expect("resolve lineage through shared sessions directory");
+
+    assert_eq!(
+        lineage.segments,
+        vec![RolloutLineageSegment {
+            rollout_id: thread_id,
+            rollout_path: fs::canonicalize(rollout_path).expect("canonical rollout path"),
+            start_ordinal: 1,
+            end: None,
+        }]
+    );
+}
+
 #[tokio::test]
 async fn resolves_lineage_at_explicit_history_position() {
     let home = TempDir::new().expect("temp dir");
