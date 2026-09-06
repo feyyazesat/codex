@@ -1652,6 +1652,8 @@ mod tests {
     async fn read_thread_uses_live_writer_rollout_path_for_external_resume() {
         let home = TempDir::new().expect("temp dir");
         let external_home = TempDir::new().expect("external temp dir");
+        std::fs::create_dir_all(home.path().join(codex_rollout::SESSIONS_SUBDIR))
+            .expect("create sessions directory");
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
         let uuid = uuid::Uuid::from_u128(406);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");

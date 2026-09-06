@@ -24,7 +24,7 @@ use super::ActivePopup;
 use super::ChatComposer;
 use super::InputResult;
 use super::QueuedInputAction;
-use super::parent_owned_command_is_allowed;
+use super::blocked_thread_command_is_allowed;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SlashValidation {
@@ -343,17 +343,22 @@ impl ChatComposer {
                 ..
             } => {
                 if let Some(sel) = popup.selected_item() {
-                    if self.blocks_direct_input {
+                    if self.direct_input_mode.is_blocked() {
                         let command_is_allowed = match &sel {
-                            CommandItem::Builtin(cmd) => {
-                                parse_slash_name(self.draft.textarea.text()).is_some_and(
-                                    |(_, args, _)| parent_owned_command_is_allowed(*cmd, args),
+                            CommandItem::Builtin(cmd) => parse_slash_name(
+                                self.draft.textarea.text(),
+                            )
+                            .is_some_and(|(_, args, _)| {
+                                blocked_thread_command_is_allowed(
+                                    self.direct_input_mode,
+                                    *cmd,
+                                    args,
                                 )
-                            }
+                            }),
                             CommandItem::ServiceTier(_) => false,
                         };
                         if !command_is_allowed {
-                            return (InputResult::ParentOwnedInputBlocked, true);
+                            return (InputResult::DirectInputBlocked, true);
                         }
                     }
                     if self

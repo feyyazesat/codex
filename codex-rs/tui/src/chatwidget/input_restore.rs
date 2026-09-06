@@ -69,7 +69,7 @@ impl ChatWidget {
             startup_offset
                 .saturating_add(draft.cursor)
                 .saturating_add(cursor_adjustment)
-        } else if existing_has_content || !startup_has_content {
+        } else if existing_has_content {
             existing_cursor
         } else {
             self.restore_composer_state(Self::composer_state_from_user_message(
@@ -118,16 +118,17 @@ impl ChatWidget {
     }
 
     pub(crate) fn submit_initial_user_message_if_pending(&mut self) {
-        if self.suppress_initial_user_message_submit || self.input_queue.rate_limit_recovery_pending
-        {
+        if self.suppress_initial_user_message_submit {
             return;
         }
         #[cfg(any(target_os = "windows", test))]
         if self.elevated_windows_sandbox_setup_required() {
             return;
         }
-        if self.blocks_direct_input {
-            if let Some(user_message) = self.initial_user_message.take() {
+        if self.direct_input_mode.is_blocked() {
+            if self.direct_input_mode == DirectInputMode::ParentOwned
+                && let Some(user_message) = self.initial_user_message.take()
+            {
                 self.restore_user_message_to_composer(user_message);
             }
             return;
@@ -179,8 +180,6 @@ impl ChatWidget {
 
     pub(super) fn pop_latest_queued_composer_state(&mut self) -> Option<ThreadComposerState> {
         if let Some(user_message) = self.input_queue.queued_user_messages.pop_back() {
-            self.input_queue.recovered_queue &= self.input_queue.has_queued_follow_up_messages()
-                || !self.input_queue.pending_steers.is_empty();
             let history_record = self
                 .input_queue
                 .queued_user_message_history_records
@@ -197,8 +196,6 @@ impl ChatWidget {
             ))
         } else {
             let user_message = self.input_queue.rejected_steers_queue.pop_back()?;
-            self.input_queue.recovered_queue &= self.input_queue.has_queued_follow_up_messages()
-                || !self.input_queue.pending_steers.is_empty();
             let history_record = self
                 .input_queue
                 .rejected_steer_history_records
@@ -392,6 +389,10 @@ impl ChatWidget {
         ));
     }
 
+    pub(crate) fn take_initial_user_message(&mut self) -> Option<UserMessage> {
+        self.initial_user_message.take()
+    }
+
     pub(super) fn restore_composer_state(&mut self, composer: ThreadComposerState) {
         let ThreadComposerState {
             text,
@@ -445,6 +446,8 @@ impl ChatWidget {
         };
         Some(ThreadInputState {
             composer: composer.has_content().then_some(composer),
+            initial_user_message: self.initial_user_message.clone(),
+            fork_model_settings: self.fork_model_settings,
             safety_buffering_prompt: self.safety_buffering_prompt.clone(),
             pending_steers: self
                 .input_queue
@@ -471,7 +474,7 @@ impl ChatWidget {
                 .input_queue
                 .queued_user_message_history_records
                 .clone(),
-            recovered_queue: self.input_queue.recovered_queue,
+            recovered_queue: false,
             user_turn_pending_start: self.input_queue.user_turn_pending_start,
             submit_pending_steers_after_interrupt: self
                 .input_queue
@@ -492,7 +495,8 @@ impl ChatWidget {
         let restored_task_running =
             preserve_in_flight_turn && input_state.as_ref().is_some_and(|state| state.task_running);
         if let Some(input_state) = input_state {
-            self.input_queue.recovered_queue = input_state.recovered_queue;
+            self.initial_user_message = input_state.initial_user_message;
+            self.fork_model_settings = input_state.fork_model_settings;
             self.current_collaboration_mode = input_state.current_collaboration_mode;
             self.active_collaboration_mask = input_state.active_collaboration_mask;
             self.safety_buffering_prompt = input_state.safety_buffering_prompt;
@@ -559,14 +563,13 @@ impl ChatWidget {
                 UserMessageHistoryRecord::UserMessageText,
             );
         } else {
+            self.initial_user_message = None;
             self.turn_lifecycle
                 .restore_running(/*running*/ false, Instant::now());
             self.safety_buffering_prompt = None;
             self.input_queue.clear();
             self.restore_composer_state(Default::default());
         }
-        self.input_queue.recovered_queue &= self.input_queue.has_queued_follow_up_messages()
-            || !self.input_queue.pending_steers.is_empty();
         let effort = self.effective_reasoning_effort();
         self.bottom_pane
             .set_active_reasoning_effort_baseline(effort.as_ref());

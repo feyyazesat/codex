@@ -2354,7 +2354,15 @@ mod tests {
                         )
                         .await?
                 }
-                CwdPromptAction::Fork => app_server.fork_thread(final_config, thread_id).await?,
+                CwdPromptAction::Fork => {
+                    app_server
+                        .fork_thread(
+                            final_config,
+                            thread_id,
+                            app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
+                        )
+                        .await?
+                }
             };
 
             assert!(!session_resume::cwds_differ(

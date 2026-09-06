@@ -533,6 +533,16 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn set_read_only_thread(&mut self) {
+        self.composer.set_read_only_thread();
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_direct_input_mode(&mut self, mode: crate::chatwidget::DirectInputMode) {
+        self.composer.set_direct_input_mode(mode);
+        self.request_redraw();
+    }
+
     /// Update the key hint shown next to queued messages so it matches the
     /// binding that `ChatWidget` actually listens for.
     pub(crate) fn set_queued_message_edit_binding(
