@@ -250,6 +250,7 @@ mod session_picker;
 mod side;
 mod startup;
 mod startup_prompts;
+mod startup_session;
 mod startup_warnings;
 mod thread_event_buffer;
 mod thread_events;

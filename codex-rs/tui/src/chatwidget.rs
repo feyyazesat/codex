@@ -188,9 +188,6 @@ const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
 const PET_SELECTION_LOADING_VIEW_ID: &str = "pet-selection-loading";
 const AMBIENT_PET_WRAP_GAP_COLUMNS: u16 = 2;
 const TUI_STUB_MESSAGE: &str = "Not available in TUI yet.";
-const PARENT_OWNED_INPUT_MESSAGE: &str =
-    "This sub-agent is controlled by its parent. Direct input is disabled.";
-
 /// Choose the keybinding used to edit the most-recently queued message.
 ///
 /// Apple Terminal, Warp, and VSCode integrated terminals intercept or silently
@@ -346,6 +343,10 @@ use self::ide_context::IdeContextState;
 mod input_queue;
 mod reconnect;
 use self::input_queue::InputQueueState;
+mod direct_input;
+pub(crate) use direct_input::DirectInputMode;
+const PARENT_OWNED_INPUT_MESSAGE: &str =
+    "This sub-agent is controlled by its parent. Direct input is disabled.";
 mod input_flow;
 mod input_restore;
 mod input_submission;
@@ -705,6 +706,8 @@ pub(crate) struct ChatWidget {
     thread_rename_block_message: Option<String>,
     active_side_conversation: bool,
     blocks_direct_input: bool,
+    direct_input_mode: DirectInputMode,
+    fork_model_settings: crate::app_server_session::ResumeModelSettings,
     external_writer_view: bool,
     misalignment_policy_violation: Option<misalignment_policy::MisalignmentViolation>,
     normal_placeholder_text: String,
@@ -1796,6 +1799,10 @@ impl ChatWidget {
     pub(crate) fn show_external_writer_thread(&mut self) {
         self.blocks_direct_input = true;
         self.external_writer_view = true;
+        self.direct_input_mode = DirectInputMode::ActiveWriterReadOnly;
+        self.fork_model_settings =
+            crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig;
+        self.bottom_pane.set_read_only_thread();
         self.pause_unavailable_thread();
         if let Some(cell) = self.transcript.active_cell.as_mut() {
             if let Some(exec) = cell.as_any_mut().downcast_mut::<ExecCell>() {

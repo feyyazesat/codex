@@ -389,14 +389,6 @@ impl App {
             .await
         {
             Ok(started) => {
-                if let Some(entry) = self.agent_navigation.get(&thread_id).cloned() {
-                    self.upsert_agent_picker_thread(
-                        thread_id,
-                        entry.agent_nickname,
-                        entry.agent_role,
-                        /*is_closed*/ false,
-                    );
-                }
                 if started.blocks_direct_input {
                     self.agent_navigation.mark_parent_owned(thread_id);
                 }
@@ -551,10 +543,15 @@ impl App {
                 .add_error_message(format!("Agent thread {thread_id} is no longer available."));
             return Ok(());
         }
-        let mut is_replay_only = self
+        let is_closed = self
             .agent_navigation
             .get(&thread_id)
             .is_some_and(|entry| entry.is_closed);
+        let mut is_replay_only = is_closed
+            || self
+                .thread_event_channels
+                .get(&thread_id)
+                .is_some_and(|channel| channel.attachment() == ThreadEventAttachment::ReplayOnly);
         let mut attached_replay_only = false;
         if self.should_attach_live_thread_for_selection(thread_id) {
             match self
@@ -563,11 +560,9 @@ impl App {
             {
                 Ok(live_attached) => {
                     attached_replay_only = !live_attached;
-                    is_replay_only = attached_replay_only;
-                }
-                Err(_) if self.thread_event_channels.contains_key(&thread_id) => {
-                    is_replay_only = true;
-                    attached_replay_only = true;
+                    if attached_replay_only {
+                        is_replay_only = true;
+                    }
                 }
                 Err(err) => {
                     self.chat_widget.add_error_message(format!(
@@ -672,6 +667,11 @@ impl App {
         self.retain_realtime_replay_state_before_replace();
         self.stop_realtime_conversation(app_server).await;
         self.render_thread_snapshot(tui, app_server, thread_id, snapshot, !is_replay_only)?;
+        if is_replay_only {
+            self.chat_widget.set_read_only_thread(
+                crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
+            );
+        }
         if is_replay_only
             && self
                 .thread_event_channels
@@ -715,6 +715,10 @@ impl App {
             .thread_event_channels
             .get(&thread_id)
             .is_some_and(|channel| channel.attachment() == ThreadEventAttachment::ExternalWriter);
+        let replay_only = self
+            .thread_event_channels
+            .get(&thread_id)
+            .is_some_and(|channel| channel.attachment() != ThreadEventAttachment::Live);
         if external_writer {
             self.chat_widget.show_external_writer_thread();
         }
@@ -726,6 +730,11 @@ impl App {
         self.app_event_tx
             .send(AppEvent::ResetTranscriptForThreadSwitch);
         self.replay_thread_snapshot(snapshot, resume_restored_queue);
+        if replay_only {
+            self.chat_widget.set_read_only_thread(
+                crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
+            );
+        }
         if external_writer {
             self.chat_widget.show_external_writer_thread();
         }
@@ -793,7 +802,7 @@ impl App {
     pub(super) async fn handle_startup_thread_started(
         &mut self,
         app_server: &mut AppServerSession,
-        result: Result<AppServerStartedThread>,
+        result: Result<AppServerStartedThread, String>,
     ) -> Result<()> {
         if !self.pending_startup_thread_start {
             if let Ok(started) = result {
@@ -875,7 +884,7 @@ impl App {
                 }
                 self.chat_widget.maybe_send_next_queued_input();
             }
-            Err(err) if self.recover_transport_error(&err) => {}
+            Err(err) if self.recover_transport_error(&color_eyre::eyre::eyre!(err.clone())) => {}
             Err(err) => {
                 let warnings = self
                     .transcript_cells

@@ -130,6 +130,8 @@ impl ThreadComposerState {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ThreadInputState {
+    pub(crate) initial_user_message: Option<UserMessage>,
+    pub(crate) fork_model_settings: crate::app_server_session::ResumeModelSettings,
     pub(crate) questions: Option<crate::bottom_pane::QuestionState>,
     pub(super) composer: Option<ThreadComposerState>,
     pub(super) safety_buffering_prompt: Option<UserMessage>,
