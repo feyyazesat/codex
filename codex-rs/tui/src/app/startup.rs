@@ -495,7 +495,7 @@ impl App {
                     Ok(resumed) => resumed,
                     Err(err) => return shutdown_on_startup_error(app_server, err).await,
                 };
-                let resumed = if read_only_thread {
+                let mut resumed = if read_only_thread {
                     match resumed {
                         Ok(resumed) => resumed,
                         Err(err) => return shutdown_on_startup_error(app_server, err).await,
@@ -519,6 +519,12 @@ impl App {
                     };
                     resumed
                 };
+                if read_only_thread
+                    && let Some(model) = harness_overrides.model.as_ref().or(config.model.as_ref())
+                {
+                    resumed.session.model = model.clone();
+                    config.model = Some(model.clone());
+                }
                 let init = crate::chatwidget::ChatWidgetInit {
                     local_settings: local_settings.clone(),
                     config: config.clone(),
@@ -540,14 +546,22 @@ impl App {
                     is_first_run,
                     status_account_display: status_account_display.clone(),
                     initial_plan_type,
-                    model: config.model.clone(),
+                    model: if read_only_thread {
+                        Some(resumed.session.model.clone())
+                    } else {
+                        config.model.clone()
+                    },
                     startup_tooltip_override: None,
                     status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
                     terminal_title_invalid_items_warned: terminal_title_invalid_items_warned
                         .clone(),
                     session_telemetry: session_telemetry.clone(),
                 };
-                (ChatWidget::new_with_app_event(init), Some(resumed))
+                let mut chat_widget = ChatWidget::new_with_app_event(init);
+                if read_only_thread {
+                    chat_widget.set_read_only_thread(model_settings);
+                }
+                (chat_widget, Some(resumed))
             }
             SessionSelection::Fork(target_session) => {
                 let explicit_permission_override =

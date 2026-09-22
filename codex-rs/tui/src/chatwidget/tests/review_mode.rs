@@ -1,4 +1,5 @@
 use super::*;
+use crate::app_server_session::ResumeModelSettings;
 use pretty_assertions::assert_eq;
 use std::collections::VecDeque;
 
@@ -376,6 +377,8 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
 
     chat.restore_thread_input_state(
         Some(ThreadInputState {
+            initial_user_message: None,
+            fork_model_settings: ResumeModelSettings::OverrideFromCurrentConfig,
             questions: None,
             composer: None,
             safety_buffering_prompt: None,

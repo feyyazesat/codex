@@ -218,6 +218,9 @@ impl ChatWidget {
             thread_rename_block_message: None,
             active_side_conversation: false,
             blocks_direct_input: false,
+            direct_input_mode: DirectInputMode::Writable,
+            fork_model_settings:
+                crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
             external_writer_view: false,
             misalignment_policy_violation: None,
             normal_placeholder_text: placeholder,
