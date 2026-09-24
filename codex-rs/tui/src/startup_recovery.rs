@@ -79,7 +79,7 @@ pub(crate) fn submitted(result: &InputResult) {
         } => Some((text, text_elements, pending_pastes.as_slice())),
         InputResult::CommandWithArgs(crate::slash_command::SlashCommand::Plan, ..) => None,
         InputResult::None
-        | InputResult::ParentOwnedInputBlocked
+        | InputResult::DirectInputBlocked
         | InputResult::Command(_)
         | InputResult::ServiceTierCommand(_)
         | InputResult::CommandWithArgs(..) => return,

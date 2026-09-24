@@ -185,6 +185,14 @@ enum ForkPresentation {
     SideConversation,
 }
 
+struct ForkThreadOptions {
+    last_turn_id: Option<String>,
+    before_turn_id: Option<String>,
+    goal_continuation: ForkGoalContinuation,
+    presentation: ForkPresentation,
+    model_settings: ResumeModelSettings,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ForkConfigSource {
     Local,
@@ -199,7 +207,7 @@ pub(crate) enum ThreadHistorySupport {
 
 fn bootstrap_request_error(context: &'static str, err: TypedRequestError) -> color_eyre::Report {
     let message = format!("{context}: {err}");
-    color_eyre::Report::new(err).wrap_err(message)
+    color_eyre::eyre::Report::new(err).wrap_err(message)
 }
 
 pub(crate) fn is_history_pagination_unsupported(source: &JSONRPCErrorError) -> bool {
@@ -338,7 +346,7 @@ pub(crate) enum ThreadParamsMode {
     Remote,
 }
 
-/// Determines where model settings come from when resuming a thread.
+/// Determines where model settings come from when resuming or forking a thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResumeModelSettings {
     /// Sends the current config's model, provider, and reasoning effort as explicit overrides.
@@ -515,6 +523,10 @@ impl AppServerSession {
         self
     }
 
+    pub(crate) fn inherit_task_tool_capabilities(&mut self, previous: &Self) {
+        self.task_tool_threads.extend(&previous.task_tool_threads);
+    }
+
     pub(crate) fn with_remote_cwd_override(mut self, remote_cwd_override: Option<PathBuf>) -> Self {
         self.remote_cwd_override = remote_cwd_override;
         self
@@ -530,11 +542,6 @@ impl AppServerSession {
 
     pub(crate) fn uses_embedded_app_server(&self) -> bool {
         matches!(&self.client, AppServerClient::InProcess(_))
-    }
-
-    /// Carry capabilities that may exist only in memory when the optional cache is unwritable.
-    pub(crate) fn inherit_task_tool_capabilities(&mut self, previous: &Self) {
-        self.task_tool_threads.extend(&previous.task_tool_threads);
     }
 
     pub(crate) fn task_tools_available(&self, thread_id: ThreadId) -> bool {
@@ -893,10 +900,13 @@ impl AppServerSession {
             local_settings,
             config,
             thread_id,
-            /*last_turn_id*/ None,
-            /*before_turn_id*/ None,
-            ForkGoalContinuation::StartIfIdle,
-            ForkPresentation::Regular,
+            ForkThreadOptions {
+                last_turn_id: None,
+                before_turn_id: None,
+                goal_continuation: ForkGoalContinuation::StartIfIdle,
+                presentation: ForkPresentation::Regular,
+                model_settings: ResumeModelSettings::OverrideFromCurrentConfig,
+            },
             /*selected_profile*/ None,
             permission_mode,
             ForkConfigSource::Local,
@@ -918,14 +928,45 @@ impl AppServerSession {
         goal_continuation: ForkGoalContinuation,
         selected_profile: Option<&PermissionProfileSelection>,
     ) -> Result<AppServerStartedThread> {
-        self.fork_thread_at_with_presentation(
+        self.fork_thread_at_with_model_settings(
             local_settings,
             config,
             thread_id,
             last_turn_id,
             before_turn_id,
             goal_continuation,
-            ForkPresentation::Regular,
+            selected_profile,
+            ResumeModelSettings::OverrideFromCurrentConfig,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "fork position and named permissions are independent"
+    )]
+    pub(crate) async fn fork_thread_at_with_model_settings(
+        &mut self,
+        local_settings: &LocalSettings,
+        config: Config,
+        thread_id: ThreadId,
+        last_turn_id: Option<String>,
+        before_turn_id: Option<String>,
+        goal_continuation: ForkGoalContinuation,
+        selected_profile: Option<&PermissionProfileSelection>,
+        model_settings: ResumeModelSettings,
+    ) -> Result<AppServerStartedThread> {
+        self.fork_thread_at_with_presentation(
+            local_settings,
+            config,
+            thread_id,
+            ForkThreadOptions {
+                last_turn_id,
+                before_turn_id,
+                goal_continuation,
+                presentation: ForkPresentation::Regular,
+                model_settings,
+            },
             selected_profile,
             ForkPermissionMode::InheritSaved,
             ForkConfigSource::Session,
@@ -943,10 +984,13 @@ impl AppServerSession {
             local_settings,
             config,
             thread_id,
-            /*last_turn_id*/ None,
-            /*before_turn_id*/ None,
-            ForkGoalContinuation::StartIfIdle,
-            ForkPresentation::SideConversation,
+            ForkThreadOptions {
+                last_turn_id: None,
+                before_turn_id: None,
+                goal_continuation: ForkGoalContinuation::StartIfIdle,
+                presentation: ForkPresentation::SideConversation,
+                model_settings: ResumeModelSettings::OverrideFromCurrentConfig,
+            },
             /*selected_profile*/ None,
             ForkPermissionMode::InheritSaved,
             ForkConfigSource::Session,
@@ -963,14 +1007,18 @@ impl AppServerSession {
         local_settings: &LocalSettings,
         config: Config,
         thread_id: ThreadId,
-        last_turn_id: Option<String>,
-        before_turn_id: Option<String>,
-        goal_continuation: ForkGoalContinuation,
-        presentation: ForkPresentation,
+        options: ForkThreadOptions,
         selected_profile: Option<&PermissionProfileSelection>,
         permission_mode: ForkPermissionMode,
         config_source: ForkConfigSource,
     ) -> Result<AppServerStartedThread> {
+        let ForkThreadOptions {
+            last_turn_id,
+            before_turn_id,
+            goal_continuation,
+            presentation,
+            model_settings,
+        } = options;
         let fork_parent = match presentation {
             ForkPresentation::Regular => self
                 .thread_read(thread_id, /*include_turns*/ false)
@@ -1000,6 +1048,7 @@ impl AppServerSession {
                 thread_id,
                 self.thread_params_mode(),
                 self.remote_cwd_override.as_deref(),
+                model_settings,
             )
         };
         if config_source == ForkConfigSource::Session {
@@ -2118,6 +2167,42 @@ pub(crate) fn thread_start_params_from_config(
     }
 }
 
+struct ThreadModelOverrides {
+    model: Option<String>,
+    model_provider: Option<String>,
+    config: Option<HashMap<String, serde_json::Value>>,
+}
+
+fn thread_model_overrides_from_config(
+    config: &Config,
+    thread_params_mode: ThreadParamsMode,
+    model_settings: ResumeModelSettings,
+) -> ThreadModelOverrides {
+    let mut config_overrides = config_request_overrides_from_config(config);
+    if model_settings == ResumeModelSettings::RestoreFromThread
+        && let Some(overrides) = config_overrides.as_mut()
+    {
+        overrides.remove("model_reasoning_effort");
+        if overrides.is_empty() {
+            config_overrides = None;
+        }
+    }
+    let (model, model_provider) = match model_settings {
+        ResumeModelSettings::OverrideFromCurrentConfig => (
+            config.model.clone(),
+            thread_params_mode.model_provider_from_config(config),
+        ),
+        ResumeModelSettings::RestoreFromThread | ResumeModelSettings::PreserveExistingThread => {
+            (None, None)
+        }
+    };
+    ThreadModelOverrides {
+        model,
+        model_provider,
+        config: config_overrides,
+    }
+}
+
 fn thread_resume_params_from_config(
     config: Config,
     thread_id: ThreadId,
@@ -2192,6 +2277,7 @@ fn thread_fork_params_from_config(
     thread_id: ThreadId,
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<&std::path::Path>,
+    model_settings: ResumeModelSettings,
 ) -> ThreadForkParams {
     let permissions = permissions_selection_from_config(&config, thread_params_mode);
     let sandbox = permissions
@@ -2203,10 +2289,15 @@ fn thread_fork_params_from_config(
             )
         })
         .flatten();
+    let ThreadModelOverrides {
+        model,
+        model_provider,
+        config: config_overrides,
+    } = thread_model_overrides_from_config(&config, thread_params_mode, model_settings);
     ThreadForkParams {
         thread_id: thread_id.to_string(),
-        model: config.model.clone(),
-        model_provider: thread_params_mode.model_provider_from_config(&config),
+        model,
+        model_provider,
         service_tier: service_tier_override_from_config(&config),
         cwd: thread_cwd_from_config(&config, thread_params_mode, remote_cwd_override),
         runtime_workspace_roots: thread_params_mode.workspace_roots_from_config(&config),
@@ -2214,7 +2305,7 @@ fn thread_fork_params_from_config(
         approvals_reviewer: approvals_reviewer_override_from_config(&config),
         sandbox,
         permissions,
-        config: config_request_overrides_from_config(&config),
+        config: config_overrides,
         base_instructions: config.base_instructions.clone().filter(|_| {
             !matches!(
                 config.base_instructions_provenance,
@@ -3220,6 +3311,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Remote,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
 
         assert_eq!(start.cwd, None);
@@ -3361,6 +3453,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Remote,
             Some(remote_cwd.as_path()),
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
 
         assert_eq!(start.cwd.as_deref(), Some("repo/on/server"));
@@ -3416,6 +3509,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
 
         let expected_service_tier = Some(Some(ServiceTier::Fast.request_value().to_string()));
@@ -3811,6 +3905,7 @@ mod tests {
                 ThreadId::new(),
                 mode,
                 /*remote_cwd_override*/ None,
+                ResumeModelSettings::OverrideFromCurrentConfig,
             );
             for overrides in [start.config, resume.config, fork.config] {
                 assert_eq!(
@@ -3837,6 +3932,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
 
         assert_eq!(params.base_instructions.as_deref(), Some("Base override."));
@@ -3853,6 +3949,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Remote,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
 
         assert_eq!(params.base_instructions, None);
@@ -3922,6 +4019,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
 
         assert_eq!(control_start.developer_instructions, None);
@@ -3952,6 +4050,7 @@ mod tests {
             thread_id,
             ThreadParamsMode::Embedded,
             /*remote_cwd_override*/ None,
+            ResumeModelSettings::OverrideFromCurrentConfig,
         );
         let expected = format!(
             "Developer override.\n\n{}",
@@ -4031,7 +4130,7 @@ mod tests {
                             phase: None,
                             memory_citation: None,
                             delivery: None,
-                            questions: None,
+                            questions: Some(Vec::new()),
                         },
                     ],
                     status: TurnStatus::Completed,

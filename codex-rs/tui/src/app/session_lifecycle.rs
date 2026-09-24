@@ -390,14 +390,6 @@ impl App {
             .await
         {
             Ok(started) => {
-                if let Some(entry) = self.agent_navigation.get(&thread_id).cloned() {
-                    self.upsert_agent_picker_thread(
-                        thread_id,
-                        entry.agent_nickname,
-                        entry.agent_role,
-                        /*is_closed*/ false,
-                    );
-                }
                 if started.blocks_direct_input {
                     self.agent_navigation.mark_parent_owned(thread_id);
                 }
@@ -573,10 +565,15 @@ impl App {
             ));
             return Ok(());
         }
-        let mut is_replay_only = self
+        let is_closed = self
             .agent_navigation
             .get(&thread_id)
             .is_some_and(|entry| entry.is_closed);
+        let mut is_replay_only = is_closed
+            || self
+                .thread_event_channels
+                .get(&thread_id)
+                .is_some_and(|channel| channel.attachment() == ThreadEventAttachment::ReplayOnly);
         let mut attached_replay_only = false;
         if self.should_attach_live_thread_for_selection(thread_id) {
             match self
@@ -585,11 +582,9 @@ impl App {
             {
                 Ok(live_attached) => {
                     attached_replay_only = !live_attached;
-                    is_replay_only = attached_replay_only;
-                }
-                Err(_) if self.thread_event_channels.contains_key(&thread_id) => {
-                    is_replay_only = true;
-                    attached_replay_only = true;
+                    if attached_replay_only {
+                        is_replay_only = true;
+                    }
                 }
                 Err(err) => {
                     self.add_agents_overview_error(format!(
@@ -695,6 +690,10 @@ impl App {
         self.retain_realtime_replay_state_before_replace();
         self.stop_realtime_conversation(app_server).await;
         self.render_thread_snapshot(tui, app_server, thread_id, snapshot, !is_replay_only)?;
+        if is_replay_only {
+            self.chat_widget
+                .set_read_only_thread(self.resume_model_settings());
+        }
         if is_replay_only
             && self
                 .thread_event_channels
@@ -710,6 +709,11 @@ impl App {
                 format!("Agent thread {thread_id} is closed. Replaying saved transcript.")
             };
             self.chat_widget.add_info_message(message, /*hint*/ None);
+        } else if is_replay_only {
+            self.chat_widget.add_info_message(
+                super::active_writer_read_only_message(thread_id),
+                /*hint*/ None,
+            );
         }
         self.refresh_pending_thread_approvals().await;
 
@@ -738,6 +742,10 @@ impl App {
             .thread_event_channels
             .get(&thread_id)
             .is_some_and(|channel| channel.attachment() == ThreadEventAttachment::ExternalWriter);
+        let replay_only = self
+            .thread_event_channels
+            .get(&thread_id)
+            .is_some_and(|channel| channel.attachment() != ThreadEventAttachment::Live);
         if external_writer {
             self.chat_widget.show_external_writer_thread();
         }
@@ -749,6 +757,11 @@ impl App {
         self.app_event_tx
             .send(AppEvent::ResetTranscriptForThreadSwitch);
         self.replay_thread_snapshot(snapshot, resume_restored_queue);
+        if replay_only {
+            self.chat_widget.set_read_only_thread(
+                crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
+            );
+        }
         if external_writer {
             self.chat_widget.show_external_writer_thread();
         }
@@ -820,7 +833,7 @@ impl App {
     pub(super) async fn handle_startup_thread_started(
         &mut self,
         app_server: &mut AppServerSession,
-        result: Result<AppServerStartedThread>,
+        result: Result<AppServerStartedThread, String>,
     ) -> Result<()> {
         if !self.pending_startup_thread_start {
             if let Ok(started) = result {
@@ -903,7 +916,7 @@ impl App {
                 }
                 self.chat_widget.maybe_send_next_queued_input();
             }
-            Err(err) if self.recover_transport_error(&err) => {}
+            Err(err) if self.recover_transport_error(&color_eyre::eyre::eyre!(err.clone())) => {}
             Err(err) => {
                 let warnings = self
                     .transcript_cells
@@ -1268,16 +1281,17 @@ impl App {
         if let Some(history_mode) = target_session.history_mode {
             app_server.remember_thread_history_mode(target_session.thread_id, history_mode);
         }
+        let resume_model_settings = self.resume_model_settings();
         let resumed = app_server
             .resume_thread(
                 &local_settings,
                 resume_config.clone(),
                 target_session.thread_id,
-                self.resume_model_settings(),
+                resume_model_settings,
             )
             .await;
         let mut history_notice = None;
-        let (resumed, read_only) = match resumed {
+        let (mut resumed, read_only) = match resumed {
             Ok(resumed) => (resumed, false),
             Err(err) if crate::app_server_session::is_active_writer_error(&err) => match app_server
                 .read_thread_for_viewing(&resume_config, &local_settings, target_session.thread_id)
@@ -1302,6 +1316,18 @@ impl App {
                 return Ok(AppRunControl::Continue);
             }
         };
+        if read_only
+            && resume_model_settings
+                == crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig
+            && let Some(model) = self
+                .harness_overrides
+                .model
+                .as_ref()
+                .or(resume_config.model.as_ref())
+        {
+            resumed.session.model.clone_from(model);
+            resume_config.model = Some(model.clone());
+        }
         let resumed_thread_id = resumed.session.thread_id;
         let retained_input = (self.chat_widget.is_external_writer_view()
             && self.chat_widget.thread_id() == Some(resumed_thread_id))
@@ -1343,7 +1369,12 @@ impl App {
                 if read_only {
                     self.ensure_thread_channel(resumed_thread_id)
                         .mark_external_writer();
+                    self.chat_widget.set_read_only_thread(resume_model_settings);
                     self.chat_widget.show_external_writer_thread();
+                    self.chat_widget.add_info_message(
+                        super::active_writer_read_only_message(resumed_thread_id),
+                        /*hint*/ None,
+                    );
                     if let Some(notice) = history_notice {
                         self.chat_widget
                             .add_info_message(notice.to_string(), /*hint*/ None);

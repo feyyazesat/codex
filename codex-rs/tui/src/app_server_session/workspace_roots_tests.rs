@@ -194,6 +194,7 @@ async fn embedded_lifecycle_requests_preserve_explicit_workspace_roots() -> Resu
         thread_id,
         ThreadParamsMode::Embedded,
         /*remote_cwd_override*/ None,
+        ResumeModelSettings::OverrideFromCurrentConfig,
     );
     assert_eq!(
         [
