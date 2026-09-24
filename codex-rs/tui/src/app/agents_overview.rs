@@ -665,7 +665,12 @@ impl App {
             if read_only {
                 self.ensure_thread_channel(root_thread_id)
                     .mark_external_writer();
+                self.chat_widget.set_read_only_thread(resume_model_settings);
                 self.chat_widget.show_external_writer_thread();
+                self.chat_widget.add_info_message(
+                    super::active_writer_read_only_message(root_thread_id),
+                    /*hint*/ None,
+                );
                 if let Some(notice) = history_notice {
                     self.chat_widget
                         .add_info_message(notice.to_string(), /*hint*/ None);

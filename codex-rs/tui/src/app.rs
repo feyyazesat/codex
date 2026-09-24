@@ -3,6 +3,12 @@
 //! This module owns the `App` struct, shared imports, and the high-level run loop that coordinates
 //! the focused app submodules.
 
+pub(super) fn active_writer_read_only_message(thread_id: ThreadId) -> String {
+    format!(
+        "Thread {thread_id} is open in another Codex client. Replaying its saved transcript in read-only mode; use /fork to continue in a new thread."
+    )
+}
+
 pub(crate) use self::agents_overview::PendingWorktree;
 use crate::AppServerTarget;
 use crate::app_backtrack::BacktrackState;
@@ -256,6 +262,8 @@ mod session_picker;
 mod side;
 mod startup;
 mod startup_prompts;
+#[cfg(test)]
+mod startup_session;
 mod startup_warnings;
 mod thread_event_buffer;
 mod thread_events;
